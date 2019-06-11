@@ -830,13 +830,31 @@ CLIENT_PACKAGES := ... ocsigen-widgets.client
 >>
 
 To create the widget, we add the following code in the
-{{{init_client}}} immediately after canvas configuration:
+{{{page}}} :
 
 <<code language="ocaml" class="client"|
 (* Color of the brush *)
-let colorpicker = Ow_color_picker.create ~width:150 () in
-Ow_color_picker.append_at (Dom_html.document##.body) colorpicker;
-Ow_color_picker.init_handler colorpicker;
+ let colorpicker, cp_sig = Ot_color_picker.make () in
+  ( Html.D.html
+      (Html.D.head
+         (Html.D.title (Html.D.txt "Graffiti"))
+         [ Html.D.css_link
+             ~uri:
+               (Html.D.make_uri
+                  (Eliom_service.static_dir ())
+                  ["css"; "graffiti.css"])
+             ()
+         ; Html.D.css_link
+             ~uri:
+               (Html.D.make_uri
+                  (Eliom_service.static_dir ())
+                  ["css"; "ot_color_picker.css"])
+             () ])
+      (Html.D.body
+         [ Html.D.div ~a:[] [canvas_elt; canvas2_elt]
+         ; Html.D.div
+             ~a:[Html.D.a_style "height: 300px; width: 400px"]
+             [colorpicker] ])
 >>
 
 We subsequently add a simple HTML slider to change the size of the
@@ -844,15 +862,26 @@ brush. Near the {{{canvas_elt}}} definition, simply add the following
 code:
 
 <<code language="ocaml" class="server"|
-let slider =
-  Eliom_content.Html.D.Form.input
-    ~a:[
-      Html.D.a_id "slider";
-      Html.D.a_input_min (`Number 1);
-      Html.D.a_input_max (`Number 80)
-    ]
-    ~input_type:`Range
-    Html.D.Form.int
+let%server slider_create () =
+  let slider_sig, slider_f = Eliom_shared.React.S.create 0 in
+  let elt =
+    let open Html.F in
+    input
+      ~a:
+        [ a_input_type `Range
+        ; a_input_min (`Number 1)
+        ; a_input_max (`Number 80)
+        ; a_value "1"
+        ; a_oninput
+            [%client
+              fun ev ->
+                match Dom_html.opt_tagged ev##.currentTarget with
+                | Some (Dom_html.Input elem) ->
+                    ~%slider_f (int_of_string (Js.to_string elem##.value))
+                | _ -> ()] ]
+      ()
+  in
+  elt
 >>
 
 {{{Form.int}}} is a typing information telling that this input takes
@@ -863,21 +892,93 @@ We then add the slider to the page body, as follows:
 
 <<code language="ocaml" class="server"|
 let page () =
-  (html
-    (head (title (txt "Graffiti")) [])
-    (body [h1 [txt "Graffiti"];
-           canvas_elt;
-           div [slider]] ))
+  let slider, slider_sig = slider_create () in
+  ...
+      (Html.D.body
+         [ Html.D.div ~a:[] [canvas_elt; canvas2_elt]
+         ; Html.D.div ~a:[] [slider]
+         ; Html.D.div
+             ~a:[Html.D.a_style "height: 300px; width: 400px"]
+             [colorpicker] ])
+  ...
+  , slider_sig
+
 >>
 
-To change the size and the color of the brush, we replace the last
-line of the function {{{compute_line}}} in {{{init_client}}} by:
+To change the size and the color of the brush, we replace {{{init_client}}} by:
 
 <<code language="ocaml" class="client"|
-let rgb = Ow_color_picker.get_rgb colorpicker in
-let size_slider = Eliom_content.Html.To_dom.of_input ~%slider in
-let size = int_of_string (Js.to_string size_slider##.value) in
-(rgb, size, (oldx, oldy), (!x, !y))
+let%client init_client ~cp_sig ~slider_sig =
+  let canvas = Html.To_dom.of_canvas ~%canvas_elt in
+  let ctx = canvas ## (getContext Dom_html._2d_) in
+  ctx##.lineCap := Js.string "round";
+  (* Another canvas, for second layer *)
+  let canvas2 = Html.To_dom.of_canvas ~%canvas2_elt in
+  let ctx2 = canvas2 ## (getContext Dom_html._2d_) in
+  ctx2##.lineCap := Js.string "round";
+  (* The initial image: *)
+  let img = Html.To_dom.of_img ~%image_elt in
+  let copy_image () = ctx ## (drawImage img 0. 0.) in
+  if Js.to_bool img##.complete
+  then copy_image ()
+  else img##.onload := Dom_html.handler (fun ev -> copy_image (); Js._false);
+  let x = ref 0 and y = ref 0 in
+  let set_coord ev =
+    let x0, y0 = Dom_html.elementClientPosition canvas in
+    x := ev##.clientX - x0;
+    y := ev##.clientY - y0
+  in
+  let compute_line set_coord x y ev =
+    let oldx = !x and oldy = !y in
+    set_coord ev;
+    let size = Eliom_shared.React.S.value slider_sig in
+    let h, s, v = Eliom_shared.React.S.value cp_sig in
+    let r, g, b = Ot_color_picker.hsv_to_rgb h s v in
+    let rgb = int_of_float r, int_of_float g, int_of_float b in
+    rgb, size, (oldx, oldy), (!x, !y)
+  in
+  let bus = ~%bus in
+  let line ev =
+    let v = compute_line set_coord x y ev in
+    let _ = Eliom_bus.write bus v in
+    draw ctx v; Lwt.return ()
+  in
+  ignore
+    ( Lwt_js.sleep 0.1 >>= fun () ->
+      (* avoid chromium looping cursor *)
+      Lwt.catch
+        (fun () -> Lwt_stream.iter (draw ctx) (Eliom_bus.stream bus))
+        (function
+          | e (* Eliom_comet.Channel_full *) ->
+              Js_of_ocaml.Firebug.console ## (log e);
+              Eliom_client.exit_to ~service:Eliom_service.reload_action () ();
+              Lwt.return ()) );
+  (let open Lwt_js_events in
+  async (fun () ->
+      mousedowns canvas2 (fun ev elt ->
+          Dom.preventDefault ev;
+          set_coord ev;
+          let%lwt () = line ev in
+          Lwt.pick
+            [ mousemoves Dom_html.document (fun a _ -> line a)
+            ; (let%lwt ev = mouseup Dom_html.document in
+               line ev) ])));
+  (* The brush *)
+  ctx2##.globalCompositeOperation := Js.string "copy";
+  let x, y, size = ref 0, ref 0, ref 0 in
+  let set_coord ev =
+    let x0, y0 = Dom_html.elementClientPosition canvas2 in
+    x := ev##.clientX - x0;
+    y := ev##.clientY - y0
+  in
+  let brush ev _ =
+    let color, newsize, oldv, v = compute_line set_coord x y ev in
+    draw ~alpha:0. ctx2 ((0, 0, 0), !size + 3, oldv, oldv);
+    size := newsize;
+    draw ctx2 (color, newsize, v, v);
+    Lwt.return ()
+  in
+  ignore Lwt_js_events.(async (fun () -> mousemoves Dom_html.document brush))
 >>
 
 Finally, we need to add a stylesheet in the headers of our page. To
@@ -885,14 +986,32 @@ easily create the {{{head}}} HTML element, we use the function <<a_api
 project="eliom" subproject="server"|val Eliom_tools.F.head>>:
 
 <<code language="ocaml" class="server"|
-let page () =
-  html
-    (Eliom_tools.F.head
-       ~title:"Graffiti"
-       ~css:[
-         ["css";"graffiti.css"];]
-      ~js:[] ())
-    (body [h1 [txt "Graffiti"]; canvas_elt; div [slider]])
+let%server page () =
+  let colorpicker, cp_sig = Ot_color_picker.make () in
+  let slider, slider_sig = slider_create () in
+  ( Html.D.html
+      (Html.D.head
+         (Html.D.title (Html.D.txt "Graffiti"))
+         [ Html.D.css_link
+             ~uri:
+               (Html.D.make_uri
+                  (Eliom_service.static_dir ())
+                  ["css"; "graffiti.css"])
+             ()
+         ; Html.D.css_link
+             ~uri:
+               (Html.D.make_uri
+                  (Eliom_service.static_dir ())
+                  ["css"; "ot_color_picker.css"])
+             () ])
+      (Html.D.body
+         [ Html.D.div ~a:[] [canvas_elt; canvas2_elt]
+         ; Html.D.div ~a:[] [slider]
+         ; Html.D.div
+             ~a:[Html.D.a_style "height: 300px; width: 400px"]
+             [colorpicker] ])
+  , cp_sig
+  , slider_sig )
 >>
 
 You need to install the corresponding stylesheets and images into your
